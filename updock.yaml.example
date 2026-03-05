@@ -1,0 +1,168 @@
+# updock.yaml – example configuration
+# Copy this file to your working directory and adjust to your setup.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP server settings
+# ─────────────────────────────────────────────────────────────────────────────
+server:
+  # Address and port to listen on.
+  bind: "0.0.0.0:8080"
+
+  # URL path Harbor will POST webhook events to.
+  # Configure the same value in Harbor → Project → Webhooks → Endpoint URL.
+  webhook_path: "/webhook"
+
+  # Shared secret set in Harbor → Project → Webhooks → Auth Header.
+  # If omitted, no authentication is performed (not recommended in production).
+  secret: "change-me-to-a-strong-random-string"
+
+  # Expose GET /v1/metrics (Prometheus text exposition).
+  http_api_metrics: true
+
+  # Enable POST /v1/update (manual trigger endpoint).
+  http_api_update: true
+
+  # Bearer token required for /v1/update and /v1/metrics when set.
+  http_api_token: "another-strong-token"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daemon settings
+# ─────────────────────────────────────────────────────────────────────────────
+daemon:
+  # Set to true to fork into the background automatically on `start`.
+  # You can also pass --daemon on the command line.
+  enabled: false
+
+  # File to store the running process PID.
+  pid_file: /var/run/updock.pid
+
+  # Directory for log output when running as a daemon.
+  log_dir: /var/log/updock
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Projects
+# Each entry maps a Harbor repository to a docker compose project on this host.
+# ─────────────────────────────────────────────────────────────────────────────
+projects:
+  # ── Example 1: deploy on every push ────────────────────────────────────────
+  - name: my-api
+    # Full Harbor repository path: <project>/<repository>
+    harbor_repository: "my-harbor-project/my-api"
+    # compose_dir must be an absolute path to the directory containing
+    # docker-compose.yml (or compose.yaml).
+    compose_dir: /opt/stacks/my-api
+    # Pull the latest images before running `up`.  Default: true.
+    pull_before_up: true
+
+  # ── Example 2: deploy only on 'production' tag pushes ──────────────────────
+  - name: my-frontend
+    harbor_repository: "my-harbor-project/my-frontend"
+    # Only trigger when the tag equals "production".
+    tag_filter: "production"
+    compose_dir: /opt/stacks/my-frontend
+    # Override the compose file name (optional).
+    compose_file: docker-compose.prod.yml
+    # Extra environment variables injected into the docker compose call.
+    env:
+      APP_ENV: production
+      REGISTRY: registry.example.com
+
+  # ── Example 3: wildcard tag filter ─────────────────────────────────────────
+  - name: my-worker
+    harbor_repository: "my-harbor-project/my-worker"
+    # Deploy on any semver-looking tag such as v1.0.0, v2.3.1, …
+    tag_filter: "v*"
+    compose_dir: /opt/stacks/my-worker
+    pull_before_up: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Watcher – Watchtower-style automatic container image updater
+# ─────────────────────────────────────────────────────────────────────────────
+watcher:
+  # Set to true to enable the polling/update loop.
+  enabled: true
+
+  # Docker socket or TCP endpoint.
+  docker_host: "unix:///var/run/docker.sock"
+
+  # Poll interval in seconds.  Mutually exclusive with `schedule`.
+  # Default: 86400 (24 hours).
+  poll_interval: 3600
+
+  # Cron schedule (6-field: sec min hour dom month dow).
+  # Overrides poll_interval when set.
+  # schedule: "0 0 4 * * *"   # every day at 04:00
+
+  # Remove old images after a container is updated.
+  cleanup: true
+
+  # Remove anonymous volumes when recreating containers.
+  remove_volumes: false
+
+  # Monitor-only mode: detect updates but never apply them.
+  monitor_only: false
+
+  # No-pull mode: compare local digests only; never pull from registry.
+  no_pull: false
+
+  # Don't restart containers after recreating them.
+  no_restart: false
+
+  # Also check containers that are stopped / exited.
+  include_stopped: false
+
+  # Restart one container at a time (adds a 2-second gap between restarts).
+  rolling_restart: false
+
+  # Only watch containers with the label
+  # com.centurylinklabs.watchtower.enable=true
+  label_enable: false
+
+  # Scope label value.  When set, only containers with the matching
+  # com.centurylinklabs.watchtower.scope=<value> label are watched.
+  # scope: "production"
+
+  # Container names to explicitly skip (supports leading '/').
+  disable_containers: []
+
+  # Restrict watching to these container names (empty = watch all).
+  watch_containers: []
+
+  # Seconds to wait before force-stopping a container.
+  stop_timeout: 10
+
+  # Enable lifecycle hook execution (pre-check, pre-update, post-update,
+  # post-check via docker exec as specified in container labels).
+  lifecycle_hooks: true
+
+  # Exit after one scan cycle (useful for CI / cron-triggered runs).
+  run_once: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notifications
+# ─────────────────────────────────────────────────────────────────────────────
+notifications:
+  # Generic JSON webhook URLs.  Payload: {"text": "<message>"}
+  # Works with Discord, Teams, Mattermost, and any compatible endpoint.
+  urls:
+    # - "https://hooks.example.com/generic"
+
+  # Slack incoming-webhook URL.
+  # slack_webhook_url: "https://hooks.slack.com/services/T.../B.../..."
+  # slack_channel: "#deployments"
+  # slack_username: "updock"
+
+  # Gotify push notification.
+  # gotify_url: "https://gotify.example.com"
+  # gotify_token: "your-app-token"
+
+  # SMTP email notification.
+  # email:
+  #   smtp_host: "smtp.example.com"
+  #   smtp_port: 587
+  #   username: "user@example.com"
+  #   password: "secret"
+  #   from: "updock@example.com"
+  #   to:
+  #     - "ops@example.com"
+  #   tls_skip_verify: false
