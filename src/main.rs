@@ -212,8 +212,12 @@ async fn cmd_start(cfg: config::Config, daemonize_flag: bool) -> anyhow::Result<
     let notifier = notify::Notifier::new(cfg.notifications.clone());
     let cfg = Arc::new(cfg);
 
+    // Channel for the HTTP /v1/update endpoint to signal an immediate scan.
+    // Buffer of 1: a second request while one is already pending is a no-op.
+    let (update_tx, update_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     // ── Spawn watcher loop (if enabled) ─────────────────────────────────────
-    if cfg.watcher.enabled {
+    let update_tx_opt: Option<tokio::sync::mpsc::Sender<()>> = if cfg.watcher.enabled {
         let watcher_cfg = Arc::new(cfg.watcher.clone());
         let m = Arc::clone(&metrics);
         let n = Arc::clone(&notifier);
@@ -226,17 +230,21 @@ async fn cmd_start(cfg: config::Config, daemonize_flag: bool) -> anyhow::Result<
                 let schedule = watcher_cfg.schedule.clone();
 
                 tokio::spawn(async move {
-                    run_watcher_loop(w, run_once, poll_interval, schedule).await;
+                    run_watcher_loop(w, run_once, poll_interval, schedule, update_rx).await;
                 });
+                Some(update_tx)
             }
             Err(e) => {
                 tracing::error!(err = %e, "failed to connect to Docker – watcher disabled");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
     // ── Build router ─────────────────────────────────────────────────────────
-    let app = server::build_router(Arc::clone(&cfg), Arc::clone(&metrics));
+    let app = server::build_router(Arc::clone(&cfg), Arc::clone(&metrics), Arc::clone(&notifier), update_tx_opt);
 
     // ── Bind listener ────────────────────────────────────────────────────────
     let listener = tokio::net::TcpListener::bind(&cfg.server.bind)
@@ -277,6 +285,7 @@ async fn run_watcher_loop(
     run_once: bool,
     poll_interval: u64,
     schedule: Option<String>,
+    mut update_rx: tokio::sync::mpsc::Receiver<()>,
 ) {
     if run_once {
         info!("watcher: run-once mode");
@@ -329,19 +338,39 @@ async fn run_watcher_loop(
 
         info!(schedule = %cron_expr, "watcher cron loop started");
 
-        // Keep this task alive – the scheduler runs its own threads.
-        std::future::pending::<()>().await;
+        // In cron mode, handle manual triggers from /v1/update while the
+        // scheduler runs its own ticks in the background.
+        loop {
+            if update_rx.recv().await.is_some() {
+                info!("watcher: immediate scan triggered via /v1/update");
+                let wc = Arc::clone(&w);
+                tokio::spawn(async move {
+                    if let Err(e) = wc.run_once().await {
+                        tracing::error!(err = %e, "on-demand watcher scan failed");
+                    }
+                });
+            } else {
+                // Channel closed – no more triggers possible.
+                std::future::pending::<()>().await;
+            }
+        }
     } else {
         // Simple interval-based loop.
         let interval_secs = if poll_interval == 0 { 86400 } else { poll_interval };
         info!(interval_secs, "watcher interval loop started");
 
-        // Run immediately on startup, then on each tick.
+        // Run immediately on startup, then on each tick or trigger.
         loop {
             if let Err(e) = w.run_once().await {
                 tracing::error!(err = %e, "watcher scan failed");
             }
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+            // Wait for either a timer tick or an immediate-scan request.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+                Some(()) = update_rx.recv() => {
+                    info!("watcher: immediate scan triggered via /v1/update");
+                }
+            }
         }
     }
 }

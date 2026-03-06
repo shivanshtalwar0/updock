@@ -61,7 +61,7 @@ pub struct ServerConfig {
 // Daemon
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DaemonConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -71,6 +71,16 @@ pub struct DaemonConfig {
 
     #[serde(default = "default_log_dir")]
     pub log_dir: PathBuf,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pid_file: default_pid_file(),
+            log_dir: default_log_dir(),
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -92,11 +102,37 @@ pub struct ProjectConfig {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Registry credentials
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Credentials for a private container registry.
+///
+/// The key used in `watcher.registries` is the registry **hostname** (and
+/// optional port), e.g. `registry.example.com` or `registry.example.com:5000`.
+/// updock matches the hostname against the image reference at pull time.
+///
+/// Supported auth methods (in priority order):
+/// 1. `username` + `password` — HTTP Basic / token auth (Harbor, GHCR, etc.)
+/// 2. `token` — bearer / identity token (some registries return these from
+///    an OAuth exchange; maps to bollard's `identitytoken` field)
+///
+/// If both are set, `username`/`password` takes precedence over `token`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct RegistryConfig {
+    /// Registry username.
+    pub username: Option<String>,
+    /// Registry password or CLI secret.
+    pub password: Option<String>,
+    /// Pre-obtained identity/bearer token (alternative to username+password).
+    pub token: Option<String>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Watcher (Watchtower-style)
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Controls the automatic container image-update polling loop.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct WatcherConfig {
     /// Enable the watcher polling loop.
     #[serde(default)]
@@ -175,6 +211,77 @@ pub struct WatcherConfig {
     /// Container names to restrict watching to. Empty = watch all.
     #[serde(default)]
     pub watch_containers: Vec<String>,
+
+    /// Ignore containers managed by Docker Compose.
+    ///
+    /// When `true` (the default), the watcher skips any container that carries
+    /// the `com.docker.compose.project` label, which Docker Compose always
+    /// sets on every service it manages.
+    ///
+    /// This prevents the watcher and the webhook `compose up` path from
+    /// fighting over the same containers: the webhook handles Compose stacks
+    /// (stopping, pulling, and recreating all services together), while the
+    /// watcher handles bare containers individually.
+    ///
+    /// Set to `false` only if you deliberately want the watcher to manage
+    /// containers that were originally created by Compose.
+    #[serde(default = "default_true")]
+    pub ignore_compose_managed: bool,
+
+    /// Per-registry credentials for private registries.
+    ///
+    /// Map key is the registry hostname (with optional port), e.g.:
+    ///   `registry.example.com` or `registry.example.com:5000`
+    ///
+    /// updock matches the hostname extracted from each container's image
+    /// reference and supplies the corresponding credentials when pulling.
+    /// Images without a registry prefix (e.g. `nginx:latest`) are treated
+    /// as Docker Hub (`index.docker.io`) — use that key to authenticate
+    /// against Docker Hub.
+    ///
+    /// Example:
+    /// ```yaml
+    /// watcher:
+    ///   registries:
+    ///     registry.example.com:
+    ///       username: myuser
+    ///       password: mypassword
+    ///     ghcr.io:
+    ///       token: ghp_xxxxxxxxxxxxx
+    ///     index.docker.io:
+    ///       username: dockerhubuser
+    ///       password: dockerhubpass
+    /// ```
+    #[serde(default)]
+    pub registries: std::collections::HashMap<String, RegistryConfig>,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            docker_host: default_docker_host(),
+            poll_interval: default_poll_interval(),
+            schedule: None,
+            cleanup: false,
+            remove_volumes: false,
+            monitor_only: false,
+            no_pull: false,
+            no_restart: false,
+            include_stopped: false,
+            revive_stopped: false,
+            rolling_restart: false,
+            label_enable: false,
+            disable_containers: vec![],
+            scope: None,
+            stop_timeout: default_stop_timeout(),
+            lifecycle_hooks: false,
+            run_once: false,
+            watch_containers: vec![],
+            ignore_compose_managed: true,
+            registries: std::collections::HashMap::new(),
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

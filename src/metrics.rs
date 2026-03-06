@@ -1,13 +1,25 @@
-/// Prometheus metrics for the watcher loop.
+/// Prometheus metrics for the watcher loop and webhook deployments.
 use prometheus::{IntCounter, IntGauge, Registry};
 use std::sync::Arc;
 
 pub struct Metrics {
+    // ── watcher ───────────────────────────────────────────────────────────────
     pub containers_scanned: IntGauge,
     pub containers_updated: IntGauge,
     pub containers_failed: IntGauge,
     pub scans_total: IntCounter,
     pub scans_skipped: IntCounter,
+
+    // ── webhook deployments ───────────────────────────────────────────────────
+    /// Total webhook-triggered deployments that succeeded (compose up exited 0).
+    pub webhook_deployments_total: IntCounter,
+    /// Total webhook-triggered deployments that failed (compose up exited non-0).
+    pub webhook_failures_total: IntCounter,
+    /// Total webhook events ignored (non-push event or no matching project).
+    pub webhook_ignored_total: IntCounter,
+    /// Total webhook events where the image digest was already up-to-date (skipped).
+    pub webhook_skipped_total: IntCounter,
+
     registry: Registry,
 }
 
@@ -38,6 +50,27 @@ impl Metrics {
         )
         .unwrap();
 
+        let webhook_deployments_total = IntCounter::new(
+            "updock_webhook_deployments_total",
+            "Number of webhook-triggered deployments that succeeded",
+        )
+        .unwrap();
+        let webhook_failures_total = IntCounter::new(
+            "updock_webhook_failures_total",
+            "Number of webhook-triggered deployments that failed",
+        )
+        .unwrap();
+        let webhook_ignored_total = IntCounter::new(
+            "updock_webhook_ignored_total",
+            "Number of webhook events ignored (non-push or no matching project)",
+        )
+        .unwrap();
+        let webhook_skipped_total = IntCounter::new(
+            "updock_webhook_skipped_total",
+            "Number of webhook deployments skipped because image digest was unchanged",
+        )
+        .unwrap();
+
         registry
             .register(Box::new(containers_scanned.clone()))
             .unwrap();
@@ -49,6 +82,18 @@ impl Metrics {
             .unwrap();
         registry.register(Box::new(scans_total.clone())).unwrap();
         registry.register(Box::new(scans_skipped.clone())).unwrap();
+        registry
+            .register(Box::new(webhook_deployments_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(webhook_failures_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(webhook_ignored_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(webhook_skipped_total.clone()))
+            .unwrap();
 
         Arc::new(Self {
             containers_scanned,
@@ -56,6 +101,10 @@ impl Metrics {
             containers_failed,
             scans_total,
             scans_skipped,
+            webhook_deployments_total,
+            webhook_failures_total,
+            webhook_ignored_total,
+            webhook_skipped_total,
             registry,
         })
     }
@@ -80,6 +129,19 @@ impl Metrics {
     }
     pub fn inc_containers_failed(&self) {
         self.containers_failed.inc();
+    }
+
+    pub fn inc_webhook_deployments(&self) {
+        self.webhook_deployments_total.inc();
+    }
+    pub fn inc_webhook_failures(&self) {
+        self.webhook_failures_total.inc();
+    }
+    pub fn inc_webhook_ignored(&self) {
+        self.webhook_ignored_total.inc();
+    }
+    pub fn inc_webhook_skipped(&self) {
+        self.webhook_skipped_total.inc();
     }
 
     /// Render all metrics as a Prometheus text exposition.

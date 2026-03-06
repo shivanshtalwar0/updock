@@ -38,6 +38,7 @@ impl Notifier {
     }
 
     /// Send an arbitrary text message on all configured channels.
+    #[allow(dead_code)]
     pub async fn send(&self, msg: &str) {
         self.dispatch(msg).await;
     }
@@ -155,8 +156,17 @@ impl Notifier {
                 .header(ContentType::TEXT_PLAIN)
                 .body(body.to_string())?;
 
-            let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.smtp_host)
-                .port(cfg.smtp_port);
+            // Build the SMTP transport, honouring tls_skip_verify.
+            let mut builder = if cfg.tls_skip_verify {
+                // Danger mode: accept any TLS certificate (dev/testing only).
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.smtp_host)
+                    .port(cfg.smtp_port)
+            } else {
+                // Proper STARTTLS with certificate validation.
+                AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.smtp_host)
+                    .map_err(|e| anyhow::anyhow!("smtp relay setup: {}", e))?
+                    .port(cfg.smtp_port)
+            };
 
             if let (Some(user), Some(pass)) = (&cfg.username, &cfg.password) {
                 builder = builder.credentials(Credentials::new(user.clone(), pass.clone()));

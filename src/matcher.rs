@@ -27,7 +27,18 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
         (Some('*'), _) => {
             // Check for `**`
             if p.get(1) == Some(&'*') {
-                // `**` – consume zero or more characters.
+                // `**` – consume zero or more characters (including `/`).
+                //
+                // Special case: if `**` is followed by `/` in the pattern,
+                // also try matching WITHOUT consuming either `**` or the `/`
+                // (i.e., the `**/` prefix is entirely optional, so `**/foo`
+                // can match `foo` as well as `a/b/foo`).
+                if p.get(2) == Some(&'/') {
+                    // Try skipping the `**/` entirely.
+                    if glob_match_inner(&p[3..], t) {
+                        return true;
+                    }
+                }
                 for i in 0..=t.len() {
                     if glob_match_inner(&p[2..], &t[i..]) {
                         return true;

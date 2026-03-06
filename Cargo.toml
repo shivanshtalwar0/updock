@@ -57,3 +57,13 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Misc
 url = "2"
+
+[dev-dependencies]
+# HTTP test client for axum integration tests
+axum-test = "15"
+# Lightweight mock HTTP server for notification tests
+wiremock = "0.6"
+# Temporary files/dirs for config and daemon tests
+tempfile = "3"
+# tokio test macros
+tokio = { version = "1", features = ["full"] }

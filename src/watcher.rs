@@ -16,6 +16,7 @@ use bollard::container::{
     KillContainerOptions, ListContainersOptions, RemoveContainerOptions, StartContainerOptions,
     StopContainerOptions,
 };
+use bollard::auth::DockerCredentials;
 use bollard::image::{CreateImageOptions, RemoveImageOptions};
 use bollard::models::{ContainerInspectResponse, EndpointSettings, HostConfig};
 use bollard::network::ConnectNetworkOptions;
@@ -41,6 +42,11 @@ pub const LABEL_PRE_CHECK: &str = "com.centurylinklabs.watchtower.lifecycle.pre-
 pub const LABEL_PRE_UPDATE: &str = "com.centurylinklabs.watchtower.lifecycle.pre-update";
 pub const LABEL_POST_UPDATE: &str = "com.centurylinklabs.watchtower.lifecycle.post-update";
 pub const LABEL_POST_CHECK: &str = "com.centurylinklabs.watchtower.lifecycle.post-check";
+
+/// Docker Compose always sets this label on every container it manages.
+/// We use it to detect and skip Compose-managed containers when
+/// `watcher.ignore_compose_managed = true`.
+pub const LABEL_COMPOSE_PROJECT: &str = "com.docker.compose.project";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Session report (used by notifier)
@@ -120,6 +126,9 @@ impl Watcher {
         }
 
         // ── update containers ────────────────────────────────────────────────
+        // Sort by depends-on labels so that dependencies are updated first.
+        let to_update = sort_by_depends_on(to_update);
+
         for c in &to_update {
             let name = container_name(c);
 
@@ -218,6 +227,17 @@ impl Watcher {
         let labels = container_labels(c);
         let name = container_name(c);
 
+        // Skip containers managed by Docker Compose to avoid fighting with
+        // the webhook compose-up path.  Docker Compose always sets the
+        // `com.docker.compose.project` label on every container it creates.
+        if self.cfg.ignore_compose_managed && labels.contains_key(LABEL_COMPOSE_PROJECT) {
+            debug!(
+                container = %name,
+                "skipping compose-managed container (ignore_compose_managed=true)"
+            );
+            return false;
+        }
+
         // Explicit name allow-list.
         if !self.cfg.watch_containers.is_empty()
             && !self.cfg.watch_containers.iter().any(|n| {
@@ -283,6 +303,9 @@ impl Watcher {
             return Ok(local_id != running_id && !running_id.is_empty());
         }
 
+        // Resolve credentials for this image's registry.
+        let creds = self.registry_credentials(&image_name);
+
         // Pull the image and compare the image ID.
         // We resolve the running container's current image ID by inspecting the
         // image by name *before* pulling, then compare against the ID *after*
@@ -295,13 +318,16 @@ impl Watcher {
             .and_then(|i| i.id)
             .unwrap_or_default();
 
-        let pulled_id = self.pull_image(&image_name).await?;
+        let pulled_id = self.pull_image(&image_name, creds).await?;
 
         Ok(pulled_id != pre_pull_id && !pre_pull_id.is_empty())
     }
 
     /// Pull an image; return its new image ID.
-    async fn pull_image(&self, image: &str) -> Result<String> {
+    ///
+    /// `credentials` are passed directly to the Docker daemon's pull API
+    /// (`X-Registry-Auth` header).  Pass `None` for public images.
+    async fn pull_image(&self, image: &str, credentials: Option<DockerCredentials>) -> Result<String> {
         let (repo, tag) = split_image_tag(image);
 
         let mut stream = self.docker.create_image(
@@ -311,7 +337,7 @@ impl Watcher {
                 ..Default::default()
             }),
             None,
-            None,
+            credentials,
         );
 
         while let Some(item) = stream.next().await {
@@ -337,6 +363,13 @@ impl Watcher {
         let name = container_name(c);
         let labels = container_labels(c);
         let _stop_signal = labels.get(LABEL_STOP_SIGNAL).cloned();
+
+        // Was the container running before we touched it?
+        let was_running = c
+            .state
+            .as_ref()
+            .and_then(|s| s.running)
+            .unwrap_or(false);
 
         // ── pre-update hook ──────────────────────────────────────────────────
         if self.cfg.lifecycle_hooks {
@@ -404,7 +437,8 @@ impl Watcher {
 
         // ── pull fresh image ─────────────────────────────────────────────────
         if !self.cfg.no_pull {
-            self.pull_image(&image_name).await?;
+            let creds = self.registry_credentials(&image_name);
+            self.pull_image(&image_name, creds).await?;
         }
 
         // ── re-create ────────────────────────────────────────────────────────
@@ -437,10 +471,18 @@ impl Watcher {
                 .await
                 .context("create_container failed")?;
 
-            self.docker
-                .start_container(&clean_name, None::<StartContainerOptions<String>>)
-                .await
-                .context("start_container failed")?;
+            // Start the container if:
+            //   - it was running before the update, OR
+            //   - revive_stopped is true (start even previously-stopped containers)
+            let should_start = was_running || self.cfg.revive_stopped;
+            if should_start {
+                self.docker
+                    .start_container(&clean_name, None::<StartContainerOptions<String>>)
+                    .await
+                    .context("start_container failed")?;
+            } else {
+                info!(container = %clean_name, "container was stopped; leaving it stopped after update");
+            }
 
             // ── restore network memberships ──────────────────────────────────
             // Docker only connects the container to a single network during
@@ -551,14 +593,96 @@ impl Watcher {
             }
         }
     }
+
+    /// Look up `DockerCredentials` for the registry that hosts `image`.
+    ///
+    /// The registry hostname is extracted from the image reference, then
+    /// matched (case-insensitively) against `cfg.registries`.  Returns
+    /// `None` if no credentials are configured for that registry.
+    fn registry_credentials(&self, image: &str) -> Option<DockerCredentials> {
+        if self.cfg.registries.is_empty() {
+            return None;
+        }
+
+        let host = registry_host_from_image(image);
+        // Normalise both sides to lowercase for a case-insensitive match.
+        let host_lower = host.to_lowercase();
+
+        let reg = self
+            .cfg
+            .registries
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == host_lower)
+            .map(|(_, v)| v)?;
+
+        // Build DockerCredentials.
+        // username+password takes priority over a bare identity token.
+        if reg.username.is_some() || reg.password.is_some() {
+            Some(DockerCredentials {
+                username: reg.username.clone(),
+                password: reg.password.clone(),
+                serveraddress: Some(host),
+                ..Default::default()
+            })
+        } else if let Some(ref tok) = reg.token {
+            Some(DockerCredentials {
+                identitytoken: Some(tok.clone()),
+                serveraddress: Some(host),
+                ..Default::default()
+            })
+        } else {
+            None
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn connect_docker(host: &str) -> Result<Docker> {
-    if host.starts_with("unix://") || host == "unix:///var/run/docker.sock" {
+/// Extract the registry hostname (and optional port) from an image reference.
+///
+/// Rules (matching Docker's own image-reference parsing):
+///
+/// - If the first path component contains a `.`, `:`, or is `localhost`, it is
+///   the registry host.
+/// - Otherwise the image is a Docker Hub short-form reference and the
+///   canonical registry is `index.docker.io`.
+///
+/// Examples:
+/// ```text
+/// "nginx"                              → "index.docker.io"
+/// "library/nginx:latest"              → "index.docker.io"
+/// "registry.example.com/myapp:v1"     → "registry.example.com"
+/// "registry.example.com:5000/myapp"   → "registry.example.com:5000"
+/// "localhost:5000/myapp"              → "localhost:5000"
+/// "ghcr.io/org/repo:tag"             → "ghcr.io"
+/// ```
+pub fn registry_host_from_image(image: &str) -> String {
+    // Strip any digest or tag suffix — we only need the first path component.
+    // Split off the first `/`-delimited component.
+    let first = match image.find('/') {
+        None => {
+            // No slash at all → plain image name like "nginx" → Docker Hub.
+            return "index.docker.io".to_string();
+        }
+        Some(pos) => &image[..pos],
+    };
+
+    // A component is a registry host if it contains '.', ':', or equals "localhost".
+    let is_registry_host = first.contains('.')
+        || first.contains(':')
+        || first.eq_ignore_ascii_case("localhost");
+
+    if is_registry_host {
+        first.to_string()
+    } else {
+        // e.g. "library/nginx" or "user/repo" → Docker Hub
+        "index.docker.io".to_string()
+    }
+}
+
+fn connect_docker(host: &str) -> Result<Docker> {    if host.starts_with("unix://") || host == "unix:///var/run/docker.sock" {
         Docker::connect_with_unix(host, 120, bollard::API_DEFAULT_VERSION)
             .context("connect to docker unix socket")
     } else if host.starts_with("tcp://") || host.starts_with("http://") {
@@ -596,6 +720,88 @@ fn is_monitor_only(c: &ContainerInspectResponse, cfg: &WatcherConfig) -> bool {
     labels.get(LABEL_MONITOR_ONLY).map(|s| s.as_str()) == Some("true")
 }
 
+/// Sort a list of containers so that dependencies come before dependents.
+///
+/// Uses Kahn's algorithm for a topological sort based on the
+/// `com.centurylinklabs.watchtower.depends-on` label.
+///
+/// The label value is a comma-separated list of container names (with or
+/// without leading `/`) that must be updated **before** this container.
+///
+/// If the label references a container that is not in the update set (e.g.
+/// it doesn't need updating this cycle), the dependency is simply ignored.
+/// Cycles are also handled gracefully: any containers involved in a cycle are
+/// appended at the end in their original order.
+fn sort_by_depends_on(
+    containers: Vec<ContainerInspectResponse>,
+) -> Vec<ContainerInspectResponse> {
+    if containers.len() <= 1 {
+        return containers;
+    }
+
+    // Map normalised name → index.
+    let name_to_idx: HashMap<String, usize> = containers
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (container_name(c).trim_start_matches('/').to_lowercase(), i))
+        .collect();
+
+    // in_degree[i] = number of dependencies that are still pending.
+    let mut in_degree: Vec<usize> = vec![0; containers.len()];
+    // edges[dep_idx] = list of indices that depend on dep_idx.
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); containers.len()];
+
+    for (i, c) in containers.iter().enumerate() {
+        let labels = container_labels(c);
+        if let Some(deps) = labels.get(LABEL_DEPENDS_ON) {
+            for dep in deps.split(',').map(|s| s.trim().trim_start_matches('/').to_lowercase()) {
+                if dep.is_empty() {
+                    continue;
+                }
+                if let Some(&dep_idx) = name_to_idx.get(&dep) {
+                    if dep_idx != i {
+                        edges[dep_idx].push(i);
+                        in_degree[i] += 1;
+                    }
+                }
+                // If the dependency is not in the update set, ignore it.
+            }
+        }
+    }
+
+    // Kahn's BFS topological sort.
+    let mut queue: std::collections::VecDeque<usize> = in_degree
+        .iter()
+        .enumerate()
+        .filter(|&(_, &d)| d == 0)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut sorted: Vec<ContainerInspectResponse> = Vec::with_capacity(containers.len());
+    // Keep originals in an Option<> so we can move them out.
+    let mut items: Vec<Option<ContainerInspectResponse>> =
+        containers.into_iter().map(Some).collect();
+
+    while let Some(idx) = queue.pop_front() {
+        if let Some(c) = items[idx].take() {
+            sorted.push(c);
+        }
+        for &next in &edges[idx] {
+            in_degree[next] -= 1;
+            if in_degree[next] == 0 {
+                queue.push_back(next);
+            }
+        }
+    }
+
+    // Append any containers involved in cycles (shouldn't happen in practice).
+    for item in items.into_iter().flatten() {
+        sorted.push(item);
+    }
+
+    sorted
+}
+
 /// Split "image:tag" → ("image", "tag"). Defaults to "latest".
 fn split_image_tag(image: &str) -> (String, String) {
     // Handle registry prefix containing ':'
@@ -629,6 +835,60 @@ mod tests {
         assert_eq!(
             split_image_tag("myapp"),
             ("myapp".into(), "latest".into())
+        );
+    }
+
+    // ── registry_host_from_image ──────────────────────────────────────────────
+
+    #[test]
+    fn registry_host_plain_name_is_docker_hub() {
+        assert_eq!(registry_host_from_image("nginx"), "index.docker.io");
+        assert_eq!(registry_host_from_image("nginx:latest"), "index.docker.io");
+    }
+
+    #[test]
+    fn registry_host_user_repo_is_docker_hub() {
+        assert_eq!(registry_host_from_image("library/nginx"), "index.docker.io");
+        assert_eq!(registry_host_from_image("myuser/myapp:v1"), "index.docker.io");
+    }
+
+    #[test]
+    fn registry_host_fqdn_registry() {
+        assert_eq!(
+            registry_host_from_image("registry.example.com/myapp:v1"),
+            "registry.example.com"
+        );
+    }
+
+    #[test]
+    fn registry_host_fqdn_with_port() {
+        assert_eq!(
+            registry_host_from_image("registry.example.com:5000/myapp:v1"),
+            "registry.example.com:5000"
+        );
+    }
+
+    #[test]
+    fn registry_host_ghcr() {
+        assert_eq!(
+            registry_host_from_image("ghcr.io/org/repo:tag"),
+            "ghcr.io"
+        );
+    }
+
+    #[test]
+    fn registry_host_localhost() {
+        assert_eq!(
+            registry_host_from_image("localhost:5000/myapp"),
+            "localhost:5000"
+        );
+    }
+
+    #[test]
+    fn registry_host_harbor_deep_path() {
+        assert_eq!(
+            registry_host_from_image("harbor.example.com/project/image:tag"),
+            "harbor.example.com"
         );
     }
 }

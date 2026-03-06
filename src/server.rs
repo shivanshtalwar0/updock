@@ -9,12 +9,15 @@ use axum::{
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use tokio::sync::mpsc;
+
 use crate::{
-    compose,
+    compose::{self, DeployResult},
     config::Config,
     harbor::HarborEvent,
     matcher::matching_projects,
     metrics::Metrics,
+    notify::Notifier,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -25,15 +28,23 @@ use crate::{
 pub struct AppState {
     pub config: Arc<Config>,
     pub metrics: Arc<Metrics>,
+    pub notifier: Arc<Notifier>,
+    /// Optional channel to request an immediate watcher scan.
+    pub update_tx: Option<mpsc::Sender<()>>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Router
 // ──────────────────────────────────────────────────────────────────────────────
 
-pub fn build_router(config: Arc<Config>, metrics: Arc<Metrics>) -> Router {
+pub fn build_router(
+    config: Arc<Config>,
+    metrics: Arc<Metrics>,
+    notifier: Arc<Notifier>,
+    update_tx: Option<mpsc::Sender<()>>,
+) -> Router {
     let path = config.server.webhook_path.clone();
-    let state = AppState { config, metrics };
+    let state = AppState { config, metrics, notifier, update_tx };
 
     let mut router = Router::new()
         .route(&path, post(webhook_handler))
@@ -84,12 +95,8 @@ async fn metrics_handler(
 
 /// POST /v1/update – manually trigger a watcher scan.
 ///
-/// This endpoint just acknowledges the request; the actual scan is triggered
-/// by sending an internal signal.  Because the watcher runs in its own
-/// tokio task, the simplest approach is to record a note and let the next
-/// interval fire.  For a truly synchronous trigger the caller should poll
-/// `/v1/metrics` or use the `/health` endpoint.
-///
+/// Sends a signal to the watcher loop via an mpsc channel, causing it to
+/// run a scan immediately instead of waiting for the next scheduled interval.
 /// Requires Bearer token auth when `http_api_token` is set.
 async fn update_handler(
     State(state): State<AppState>,
@@ -102,8 +109,27 @@ async fn update_handler(
         }
     }
 
-    info!("/v1/update called – watcher will run on next cycle");
-    (StatusCode::ACCEPTED, "update scheduled\n").into_response()
+    if let Some(ref tx) = state.update_tx {
+        // Non-blocking send: if the channel is full the watcher is already
+        // scheduled to run imminently, so we don't need to queue another.
+        match tx.try_send(()) {
+            Ok(()) => {
+                info!("/v1/update called – immediate watcher scan triggered");
+                (StatusCode::ACCEPTED, "update triggered\n").into_response()
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                info!("/v1/update called – scan already pending");
+                (StatusCode::ACCEPTED, "update already pending\n").into_response()
+            }
+            Err(e) => {
+                warn!(err = %e, "/v1/update: watcher channel send failed");
+                (StatusCode::SERVICE_UNAVAILABLE, "watcher unavailable\n").into_response()
+            }
+        }
+    } else {
+        info!("/v1/update called – watcher not enabled");
+        (StatusCode::SERVICE_UNAVAILABLE, "watcher not enabled\n").into_response()
+    }
 }
 
 /// POST <webhook_path> – receives a Harbor webhook and triggers deployments.
@@ -140,6 +166,7 @@ async fn webhook_handler(
     // ── 3. Only act on push events ──────────────────────────────────────────
     if event.event_type != "PUSH_ARTIFACT" {
         info!(event_type = %event.event_type, "ignoring non-push event");
+        state.metrics.inc_webhook_ignored();
         return (StatusCode::OK, "ignored\n").into_response();
     }
 
@@ -150,32 +177,91 @@ async fn webhook_handler(
 
     if projects.is_empty() {
         info!(repository = %repo, "no projects matched, nothing to do");
+        state.metrics.inc_webhook_ignored();
         return (StatusCode::OK, "no match\n").into_response();
     }
 
     // ── 5. Trigger deployments (in parallel) ───────────────────────────────
+    // Collect handles so we can await results for metrics + notifications.
     let mut handles = Vec::new();
     for project in projects {
         let project = project.clone();
         let handle = tokio::spawn(async move {
-            if let Err(err) = compose::deploy(&project).await {
-                error!(
-                    project = %project.name,
-                    %err,
-                    "deployment failed"
-                );
-            }
+            let result = compose::deploy(&project).await;
+            (project.name.clone(), result)
         });
         handles.push(handle);
     }
 
+    // Await all deployments in a background task so the HTTP response is
+    // returned immediately (Harbor expects a fast acknowledgement).
+    let metrics = Arc::clone(&state.metrics);
+    let notifier = Arc::clone(&state.notifier);
+
     tokio::spawn(async move {
-        for h in handles {
-            let _ = h.await;
+        let mut deployed: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+
+        for handle in handles {
+            match handle.await {
+                Ok((name, DeployResult::Deployed)) => {
+                    info!(project = %name, "webhook deployment succeeded");
+                    metrics.inc_webhook_deployments();
+                    deployed.push(name);
+                }
+                Ok((name, DeployResult::UpToDate)) => {
+                    info!(project = %name, "webhook deployment skipped: images already up-to-date");
+                    metrics.inc_webhook_skipped();
+                    skipped.push(name);
+                }
+                Ok((name, DeployResult::Failed(err))) => {
+                    error!(project = %name, err = %err, "webhook deployment failed");
+                    metrics.inc_webhook_failures();
+                    failed.push(name);
+                }
+                Err(join_err) => {
+                    error!(err = %join_err, "webhook deployment task panicked");
+                }
+            }
+        }
+
+        // Send notification if anything notable happened.
+        if !deployed.is_empty() || !failed.is_empty() {
+            let msg = format_webhook_report(&deployed, &skipped, &failed);
+            notifier.send(&msg).await;
         }
     });
 
     (StatusCode::OK, "deployment triggered\n").into_response()
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Notification formatting
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Format a human-readable webhook deployment summary.
+fn format_webhook_report(
+    deployed: &[String],
+    skipped: &[String],
+    failed: &[String],
+) -> String {
+    let mut lines = vec![format!(
+        "[updock webhook] {} deployed, {} skipped, {} failed",
+        deployed.len(),
+        skipped.len(),
+        failed.len()
+    )];
+    for name in deployed {
+        lines.push(format!("  ✓ deployed: {}", name));
+    }
+    for name in skipped {
+        lines.push(format!("  - skipped:  {} (already up-to-date)", name));
+    }
+    for name in failed {
+        lines.push(format!("  ✗ failed:   {}", name));
+    }
+    lines.join("\n")
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -226,4 +312,40 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         .zip(b.bytes())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_webhook_report_all_deployed() {
+        let msg = format_webhook_report(
+            &["proj-a".to_string(), "proj-b".to_string()],
+            &[],
+            &[],
+        );
+        assert!(msg.contains("2 deployed"));
+        assert!(msg.contains("0 failed"));
+        assert!(msg.contains("✓ deployed: proj-a"));
+        assert!(msg.contains("✓ deployed: proj-b"));
+    }
+
+    #[test]
+    fn format_webhook_report_with_failures() {
+        let msg = format_webhook_report(&[], &[], &["proj-c".to_string()]);
+        assert!(msg.contains("1 failed"));
+        assert!(msg.contains("✗ failed:   proj-c"));
+    }
+
+    #[test]
+    fn format_webhook_report_with_skipped() {
+        let msg = format_webhook_report(&[], &["proj-d".to_string()], &[]);
+        assert!(msg.contains("1 skipped"));
+        assert!(msg.contains("already up-to-date"));
+    }
 }
