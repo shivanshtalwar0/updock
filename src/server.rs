@@ -170,18 +170,32 @@ async fn webhook_handler(
         return (StatusCode::OK, "ignored\n").into_response();
     }
 
-    // ── 4. Match projects ───────────────────────────────────────────────────
+    // ── 4. A push means a watched container may have a newer image: check now
+    // rather than at the next poll (the watcher checks only its opted-in containers).
+    let scan_triggered = match state.update_tx {
+        Some(ref tx) => {
+            let sent = tx.try_send(()).is_ok();
+            info!(repository = %event.repository_full_name(), sent, "push: immediate watcher scan requested");
+            true
+        }
+        None => false,
+    };
+
+    // ── 5. Match projects ───────────────────────────────────────────────────
     let repo = event.repository_full_name();
     let tags = event.pushed_tags();
     let projects = matching_projects(&state.config.projects, &repo, &tags);
 
     if projects.is_empty() {
         info!(repository = %repo, "no projects matched, nothing to do");
+        if scan_triggered {
+            return (StatusCode::OK, "scan triggered\n").into_response();
+        }
         state.metrics.inc_webhook_ignored();
         return (StatusCode::OK, "no match\n").into_response();
     }
 
-    // ── 5. Trigger deployments (in parallel) ───────────────────────────────
+    // ── 6. Trigger deployments (in parallel) ───────────────────────────────
     // Collect handles so we can await results for metrics + notifications.
     let mut handles = Vec::new();
     for project in projects {

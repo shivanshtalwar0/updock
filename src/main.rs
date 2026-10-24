@@ -6,6 +6,7 @@ mod matcher;
 mod metrics;
 mod notify;
 mod server;
+mod swap;
 mod watcher;
 
 use anyhow::Context;

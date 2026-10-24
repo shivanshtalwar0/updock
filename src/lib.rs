@@ -8,4 +8,5 @@ pub mod matcher;
 pub mod metrics;
 pub mod notify;
 pub mod server;
+pub mod swap;
 pub mod watcher;
