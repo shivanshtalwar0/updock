@@ -532,3 +532,17 @@ async fn webhook_auth_rejects_suffix_of_correct_secret() {
         .await;
     response.assert_status(StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn a_push_triggers_an_immediate_watcher_scan() {
+    // A Harbor push means a watched container may have a newer image: the watcher
+    // checks now instead of waiting for its next poll.
+    let cfg = server_cfg_minimal();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    let router = build_router(make_config(cfg), Metrics::new(), make_notifier(), Some(tx));
+    let server = TestServer::new(router).unwrap();
+    let response = server.post("/webhook").json(&push_payload("voxmin/voxmin-frontend", "testing-amd64")).await;
+    response.assert_status(StatusCode::OK);
+    assert_eq!(response.text(), "scan triggered\n");
+    assert!(rx.try_recv().is_ok(), "a scan was requested");
+}

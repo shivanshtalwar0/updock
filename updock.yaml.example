@@ -116,6 +116,7 @@ watcher:
 
   # Only watch containers with the label
   # com.centurylinklabs.watchtower.enable=true
+  # Recommended: only containers labelled `updock.enable=true` are updated (start-first, see README).
   label_enable: false
 
   # Scope label value.  When set, only containers with the matching

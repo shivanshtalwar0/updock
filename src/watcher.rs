@@ -12,14 +12,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, InspectContainerOptions,
+    CreateContainerOptions, InspectContainerOptions,
     KillContainerOptions, ListContainersOptions, RemoveContainerOptions, StartContainerOptions,
     StopContainerOptions,
 };
 use bollard::auth::DockerCredentials;
 use bollard::image::{CreateImageOptions, RemoveImageOptions};
-use bollard::models::{ContainerInspectResponse, EndpointSettings, HostConfig};
-use bollard::network::ConnectNetworkOptions;
+use bollard::models::ContainerInspectResponse;
 use bollard::Docker;
 use futures_util::stream::StreamExt;
 use tracing::{debug, error, info, warn};
@@ -175,6 +174,17 @@ impl Watcher {
         Ok(report)
     }
 
+    /// Pull `name`'s image and replace it now (start-first when it can be),
+    /// whatever its labels say: the manual deploy (`updock swap <name>`).
+    pub async fn replace_now(&self, name: &str) -> Result<()> {
+        let c = self
+            .docker
+            .inspect_container(name, Some(InspectContainerOptions { size: false }))
+            .await
+            .with_context(|| format!("no container named {name}"))?;
+        self.update_container(&c).await
+    }
+
     // ── internal helpers ─────────────────────────────────────────────────────
 
     /// List all containers that should be watched according to config + labels.
@@ -255,16 +265,16 @@ impl Watcher {
         }
 
         // Watchtower enable label.
+        // Opt-in label: `updock.enable` or Watchtower's.
+        let enabled = |key: &str| labels.get(key).map(|s| s.trim().to_ascii_lowercase());
+        let opted = [crate::swap::LABEL_UPDOCK_ENABLE, LABEL_ENABLE].iter().find_map(|k| enabled(k));
         if self.cfg.label_enable {
-            match labels.get(LABEL_ENABLE).map(|s| s.as_str()) {
-                Some("true") => {}
-                _ => return false,
-            }
-        } else {
-            // If label-enable mode is off, exclude containers explicitly disabled.
-            if labels.get(LABEL_ENABLE).map(|s| s.as_str()) == Some("false") {
+            if opted.as_deref() != Some("true") {
                 return false;
             }
+        } else if opted.as_deref() == Some("false") {
+            // If label-enable mode is off, exclude containers explicitly disabled.
+            return false;
         }
 
         // Scope filter.
@@ -301,6 +311,15 @@ impl Watcher {
                 .context("inspect_image failed")?;
             let local_id = local.id.unwrap_or_default();
             return Ok(local_id != running_id && !running_id.is_empty());
+        }
+
+        // A locally built image (no registry digest) has nothing to pull: checking it
+        // only fails, every cycle. It is skipped quietly.
+        if let Ok(local) = self.docker.inspect_image(&image_name).await {
+            if local.repo_digests.as_ref().is_none_or(|d| d.is_empty()) {
+                debug!(image = %image_name, "locally built image: no registry to check");
+                return Ok(false);
+            }
         }
 
         // Resolve credentials for this image's registry.
@@ -376,6 +395,16 @@ impl Watcher {
             self.run_lifecycle_hook(c, LABEL_PRE_UPDATE, "pre-update").await;
         }
 
+        // ── start-first when the container allows it ─────────────────────────
+        if was_running && !self.cfg.no_restart {
+            match crate::swap::plan(c, self.cfg.stop_timeout) {
+                Ok(plan) => return self.update_start_first(c, &plan).await,
+                Err(crate::swap::StopFirst(why)) => {
+                    warn!(container = %name, reason = %why, "replacing stop-first: the service is down until the new container starts");
+                }
+            }
+        }
+
         // ── stop (custom signal if label is set, otherwise normal stop) ──────
         info!(container = %name, "stopping container");
         if let Some(ref signal) = _stop_signal {
@@ -395,23 +424,8 @@ impl Watcher {
             .await
             .context("stop_container failed")?;
 
-        // ── capture config before removal ────────────────────────────────────
-        let host_config: Option<HostConfig> = c.host_config.clone();
+        // ── capture what the recreate needs before removal ───────────────────
         let image_name = container_image(c);
-        let env = c.config.as_ref().and_then(|cfg| cfg.env.clone());
-        let cmd = c.config.as_ref().and_then(|cfg| cfg.cmd.clone());
-        let entrypoint = c.config.as_ref().and_then(|cfg| cfg.entrypoint.clone());
-        let exposed_ports = c.config.as_ref().and_then(|cfg| cfg.exposed_ports.clone());
-        let volumes = c.config.as_ref().and_then(|cfg| cfg.volumes.clone());
-        let working_dir = c.config.as_ref().and_then(|cfg| cfg.working_dir.clone());
-        let original_labels = c.config.as_ref().and_then(|cfg| cfg.labels.clone());
-
-        // Capture network memberships so we can restore them after recreation.
-        let networks: HashMap<String, EndpointSettings> = c
-            .network_settings
-            .as_ref()
-            .and_then(|ns| ns.networks.clone())
-            .unwrap_or_default();
 
         // Capture the current image ID before pulling/removing, so we can
         // clean it up afterwards if watcher.cleanup = true.
@@ -445,18 +459,10 @@ impl Watcher {
         if !self.cfg.no_restart {
             info!(container = %name, image = %image_name, "recreating container");
 
-            let new_config = ContainerConfig {
-                image: Some(image_name.clone()),
-                env,
-                cmd,
-                entrypoint,
-                exposed_ports,
-                volumes,
-                working_dir,
-                labels: original_labels,
-                host_config,
-                ..Default::default()
-            };
+            // The whole configuration, every network with its aliases included at
+            // create: attaching them afterwards failed ("endpoint already exists" on
+            // the NetworkMode network) and lost the aliases.
+            let new_config = crate::swap::replacement_config(c, &image_name, name.trim_start_matches('/'), true);
 
             let clean_name = name.trim_start_matches('/').to_string();
 
@@ -484,26 +490,6 @@ impl Watcher {
                 info!(container = %clean_name, "container was stopped; leaving it stopped after update");
             }
 
-            // ── restore network memberships ──────────────────────────────────
-            // Docker only connects the container to a single network during
-            // create_container.  Re-attach all networks that were present
-            // before removal so the container ends up on the same networks.
-            for (network_name, endpoint) in &networks {
-                let connect_cfg = ConnectNetworkOptions {
-                    container: clean_name.clone(),
-                    endpoint_config: endpoint.clone(),
-                };
-                if let Err(e) = self.docker.connect_network(network_name, connect_cfg).await {
-                    // Non-fatal: log and continue; the container is already
-                    // running and the main network (from host_config) is fine.
-                    warn!(
-                        container = %clean_name,
-                        network = %network_name,
-                        err = %e,
-                        "failed to reconnect container to network"
-                    );
-                }
-            }
         }
 
         // ── post-update hook ─────────────────────────────────────────────────
@@ -541,6 +527,33 @@ impl Watcher {
             }
         }
 
+        Ok(())
+    }
+
+    /// Replace `c` start-first (`swap.rs`): the old container serves until the new
+    /// one is ready and answers on the service's names.
+    async fn update_start_first(&self, c: &ContainerInspectResponse, plan: &crate::swap::SwapPlan) -> Result<()> {
+        let image_name = container_image(c);
+        let old_image_id: Option<String> = c.image.clone();
+        if !self.cfg.no_pull {
+            let creds = self.registry_credentials(&image_name);
+            self.pull_image(&image_name, creds).await?;
+        }
+        info!(container = %plan.canonical, image = %image_name, temp = %plan.temp, "replacing start-first");
+        let engine = crate::swap::Bollard { docker: &self.docker, http: reqwest::Client::new() };
+        crate::swap::swap(&engine, c, &image_name, plan).await?;
+
+        if self.cfg.lifecycle_hooks {
+            if let Ok(new_c) = self.docker.inspect_container(&plan.canonical, Some(InspectContainerOptions { size: false })).await {
+                self.run_lifecycle_hook(&new_c, LABEL_POST_UPDATE, "post-update").await;
+            }
+        }
+        if self.cfg.cleanup {
+            if let Some(old_id) = old_image_id.filter(|id| !id.is_empty()) {
+                debug!(image_id = %old_id, "removing old image");
+                let _ = self.docker.remove_image(&old_id, Some(RemoveImageOptions { force: false, noprune: false }), None).await;
+            }
+        }
         Ok(())
     }
 

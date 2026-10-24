@@ -82,6 +82,35 @@ Push an image and watch the containers redeploy.
 
 ---
 
+## Zero-downtime updates (start-first)
+
+A watched container is replaced **start-first**: the old one keeps serving until the new one is ready and answering on the service's names.
+
+1. The new container is created under a temporary name (`<name>-updock-<id>`) with the old one's whole configuration, on the same networks but **without** the service's aliases, so nothing routes to it yet.
+2. updock waits until it is ready:
+   - its Docker `HEALTHCHECK` reports `healthy`; or
+   - `updock.health.port` (+ `updock.health.path`) answers below 500 on the container's own IP; or
+   - it is still running after `updock.health.grace` seconds.
+3. It gets the service's aliases, including the container name, so both containers answer.
+4. After `updock.drain.delay` seconds, the old container is stopped gracefully (its stop signal, then `updock.stop.timeout` seconds to finish its requests) and removed.
+5. The new container is renamed to the service's name.
+
+If the new container never gets ready (`updock.health.timeout`), it is removed and the old one keeps running. Containers that publish host ports or pin a static IP can't have a twin beside them, so they are replaced stop-first; updock logs why. `updock.strategy=stop-first` forces it.
+
+Both strategies create the container with every network and its aliases in one request. Before this, an update re-attached networks afterwards, which failed with "endpoint … already exists in network" and silently dropped every alias.
+
+| Label | Default | Meaning |
+|---|---|---|
+| `updock.enable` | — | `true` opts the container in when `watcher.label_enable: true` (Watchtower's `com.centurylinklabs.watchtower.enable` works too) |
+| `updock.strategy` | `start-first` | or `stop-first` |
+| `updock.health.port` / `updock.health.path` | — / `/` | HTTP readiness probe |
+| `updock.health.timeout` | `120` | seconds the new container may take to get ready |
+| `updock.health.grace` | `10` | with no healthcheck and no probe: seconds it must stay up |
+| `updock.drain.delay` | `3` | seconds both containers answer before the old one is stopped |
+| `updock.stop.timeout` | `max(watcher.stop_timeout, 30)` | seconds the old container gets to finish its requests |
+
+A Harbor push to the webhook also triggers an immediate watcher scan, so a long `poll_interval` (e.g. 300) only matters as a fallback. Locally built images (no registry digest) are skipped instead of failing every scan.
+
 ## Documentation
 
 | Guide | What it covers |
