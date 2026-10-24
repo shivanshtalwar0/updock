@@ -52,6 +52,14 @@ enum Commands {
 
     /// Print the current status (running / stopped).
     Status,
+
+    /// Pull a container's image and replace the container now, start-first
+    /// (zero downtime when it publishes no host ports; see README). For services
+    /// that are not auto-updated, e.g. production: `updock -c updock.yaml swap voxmin-backend`.
+    Swap {
+        /// The container's name.
+        container: String,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -71,6 +79,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stop => cmd_stop(&cfg),
         Commands::Start { daemon: daemonize_flag } => {
             cmd_start(cfg, daemonize_flag).await?;
+        }
+        Commands::Swap { container } => {
+            init_logging();
+            let w = watcher::Watcher::new(Arc::new(cfg.watcher.clone()), metrics::Metrics::new(), notify::Notifier::new(cfg.notifications.clone()))?;
+            w.replace_now(&container).await?;
+            println!("{container}: replaced");
         }
     }
 

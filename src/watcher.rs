@@ -174,6 +174,17 @@ impl Watcher {
         Ok(report)
     }
 
+    /// Pull `name`'s image and replace it now (start-first when it can be),
+    /// whatever its labels say: the manual deploy (`updock swap <name>`).
+    pub async fn replace_now(&self, name: &str) -> Result<()> {
+        let c = self
+            .docker
+            .inspect_container(name, Some(InspectContainerOptions { size: false }))
+            .await
+            .with_context(|| format!("no container named {name}"))?;
+        self.update_container(&c).await
+    }
+
     // ── internal helpers ─────────────────────────────────────────────────────
 
     /// List all containers that should be watched according to config + labels.
